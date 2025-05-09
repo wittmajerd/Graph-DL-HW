@@ -1,232 +1,250 @@
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GCNConv, GATConv, GINConv, NNConv, Set2Set, global_mean_pool, global_add_pool
-from torch_geometric.nn import SchNet, DimeNet, GCN, GAT, GIN
+from torch_geometric.nn import (
+    GCNConv, GATConv, GINConv, NNConv,
+    Set2Set, global_mean_pool, global_add_pool
+)
+from torch_geometric.nn.models import SchNet, DimeNet # Using the models from PyG directly
 
-# 1. GCN - Simple and effective
-class GCN(torch.nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels):
+# Common practice: QM9 node features (data.x) often represent atom types.
+# SchNet and DimeNet use data.z (atomic numbers) for their internal embeddings.
+
+class GCNModel(nn.Module):
+    def __init__(self, num_node_features: int, hidden_channels: int, num_targets: int,
+                 num_layers: int = 3, dropout_rate: float = 0.1):
         super().__init__()
-        self.conv1 = GCNConv(in_channels, hidden_channels)
-        self.conv2 = GCNConv(hidden_channels, hidden_channels)
-        self.linear = torch.nn.Linear(hidden_channels, out_channels)
-    
+        self.num_layers = num_layers
+        self.dropout_rate = dropout_rate
+        
+        self.convs = nn.ModuleList()
+        self.batch_norms = nn.ModuleList()
+
+        if num_layers == 1:
+            self.convs.append(GCNConv(num_node_features, hidden_channels)) # Output directly to hidden for linear
+        else:
+            self.convs.append(GCNConv(num_node_features, hidden_channels))
+            self.batch_norms.append(nn.BatchNorm1d(hidden_channels))
+            for _ in range(num_layers - 2):
+                self.convs.append(GCNConv(hidden_channels, hidden_channels))
+                self.batch_norms.append(nn.BatchNorm1d(hidden_channels))
+            self.convs.append(GCNConv(hidden_channels, hidden_channels)) # Last conv layer
+
+        self.linear = nn.Linear(hidden_channels, num_targets)
+
     def forward(self, x, edge_index, batch):
-        x = self.conv1(x, edge_index)
-        x = F.relu(x)
-        x = F.dropout(x, p=0.1, training=self.training)
-        x = self.conv2(x, edge_index)
-        x = F.relu(x)
+        for i in range(self.num_layers):
+            x = self.convs[i](x, edge_index)
+            if i < self.num_layers -1 : # No batch norm after last conv before pooling
+                 if self.batch_norms: # if num_layers > 1
+                    x = self.batch_norms[i](x)
+            x = F.relu(x)
+            if i < self.num_layers - 1: # No dropout after last conv before pooling
+                x = F.dropout(x, p=self.dropout_rate, training=self.training)
         
-        # Graph-level readout
         x = global_mean_pool(x, batch)
-        
-        # Prediction layer
         x = self.linear(x)
         return x
-    
 
-# 2. GAT - Attention-based approach
-class GAT(torch.nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels, heads=8):
+class GATModel(nn.Module):
+    def __init__(self, num_node_features: int, hidden_channels: int, num_targets: int,
+                 num_layers: int = 3, heads: int = 8, dropout_rate: float = 0.1):
         super().__init__()
-        self.conv1 = GATConv(in_channels, hidden_channels, heads=heads)
-        self.conv2 = GATConv(hidden_channels*heads, hidden_channels, heads=1)
-        self.linear = torch.nn.Linear(hidden_channels, out_channels)
-    
+        self.num_layers = num_layers
+        self.dropout_rate = dropout_rate
+        
+        self.convs = nn.ModuleList()
+        
+        # Input layer
+        self.convs.append(GATConv(num_node_features, hidden_channels, heads=heads, dropout=dropout_rate))
+        
+        # Hidden layers
+        for _ in range(num_layers - 2):
+            self.convs.append(GATConv(hidden_channels * heads, hidden_channels, heads=heads, dropout=dropout_rate))
+            
+        # Output layer of GAT convolutions (before pooling and linear)
+        # The last GATConv layer typically uses heads=1 or concatenates and then reduces dimension.
+        # Here, we use heads=1 for the final GAT layer output to match hidden_channels.
+        if num_layers > 1:
+            self.convs.append(GATConv(hidden_channels * heads, hidden_channels, heads=1, concat=True, dropout=dropout_rate))
+        # If num_layers is 1, the first layer's output (hidden_channels * heads) will be used.
+        # This needs to be handled by the linear layer input size.
+        
+        # Adjust linear layer input based on whether the last GAT layer concatenates
+        if num_layers == 1:
+            linear_in_features = hidden_channels * heads
+        else: # num_layers > 1, last GATConv has heads=1 and concat=True, so output is hidden_channels
+            linear_in_features = hidden_channels
+            
+        self.linear = nn.Linear(linear_in_features, num_targets)
+
     def forward(self, x, edge_index, batch):
-        x = self.conv1(x, edge_index)
-        x = F.elu(x)
-        x = self.conv2(x, edge_index)
-        x = F.elu(x)
+        for i in range(self.num_layers):
+            x = self.convs[i](x, edge_index)
+            # ELU activation is common for GAT, and dropout is handled within GATConv
+            if i < self.num_layers - 1 : # No activation after the final GAT conv if it's the one before pooling
+                 x = F.elu(x)
         
-        # Graph-level readout
         x = global_mean_pool(x, batch)
-        
-        # Prediction layer
         x = self.linear(x)
         return x
-    
-class GATModel(torch.nn.Module):
-    def __init__(self, node_features, hidden_channels, num_targets):
-        super(GATModel, self).__init__()
-        self.conv1 = GATConv(node_features, hidden_channels)
-        self.conv2 = GATConv(hidden_channels, hidden_channels)
-        self.conv3 = GATConv(hidden_channels, hidden_channels)
-        self.lin = torch.nn.Linear(hidden_channels, num_targets)
-        
-    def forward(self, x, edge_index, batch):
-        # Graph convolutions
-        x = self.conv1(x, edge_index)
-        x = F.relu(x)
-        x = F.dropout(x, p=0.2, training=self.training)
-        
-        x = self.conv2(x, edge_index)
-        x = F.relu(x)
-        x = F.dropout(x, p=0.2, training=self.training)
-        
-        x = self.conv3(x, edge_index)
-        x = F.relu(x)
-        
-        # Graph-level readout
-        x = global_mean_pool(x, batch)
-        
-        # Prediction
-        x = self.lin(x)
-        
-        return x
-    
 
-class GINModel(torch.nn.Module):
-    def __init__(self, node_features, hidden_channels, num_targets):
-        super(GINModel, self).__init__()
-        
-        nn1 = torch.nn.Sequential(
-            torch.nn.Linear(node_features, hidden_channels),
-            torch.nn.BatchNorm1d(hidden_channels),
-            torch.nn.ReLU(),
-            torch.nn.Linear(hidden_channels, hidden_channels)
-        )
-        self.conv1 = GINConv(nn1)
-        
-        nn2 = torch.nn.Sequential(
-            torch.nn.Linear(hidden_channels, hidden_channels),
-            torch.nn.BatchNorm1d(hidden_channels),
-            torch.nn.ReLU(),
-            torch.nn.Linear(hidden_channels, hidden_channels)
-        )
-        self.conv2 = GINConv(nn2)
-        
-        self.lin = torch.nn.Linear(hidden_channels, num_targets)
-        
-    def forward(self, x, edge_index, batch):
-        x = self.conv1(x, edge_index)
-        x = F.relu(x)
-        
-        x = self.conv2(x, edge_index)
-        x = F.relu(x)
-        
-        x = global_add_pool(x, batch)
-        x = self.lin(x)
-        
-        return x
-    
+class GINModel(nn.Module):
+    def __init__(self, num_node_features: int, hidden_channels: int, num_targets: int,
+                 num_layers: int = 3, dropout_rate: float = 0.1, train_eps: bool = False):
+        super().__init__()
+        self.num_layers = num_layers
+        self.dropout_rate = dropout_rate
 
-class SchNetModel(torch.nn.Module):
-    def __init__(self, hidden_channels=128, num_targets=14):
-        super(SchNetModel, self).__init__()
-        
+        self.convs = nn.ModuleList()
+        self.batch_norms = nn.ModuleList()
+
+        # Input layer MLP
+        nn_in = nn.Sequential(
+            nn.Linear(num_node_features, hidden_channels),
+            nn.ReLU(),
+            nn.BatchNorm1d(hidden_channels),
+            nn.Linear(hidden_channels, hidden_channels),
+            nn.ReLU(),
+            nn.BatchNorm1d(hidden_channels)
+        )
+        self.convs.append(GINConv(nn_in, eps=0 if not train_eps else torch.rand(1).item(), train_eps=train_eps)) # eps can be learned
+
+        # Hidden layers MLPs
+        for _ in range(num_layers - 1):
+            mlp = nn.Sequential(
+                nn.Linear(hidden_channels, hidden_channels),
+                nn.ReLU(),
+                nn.BatchNorm1d(hidden_channels),
+                nn.Linear(hidden_channels, hidden_channels),
+                nn.ReLU(),
+                nn.BatchNorm1d(hidden_channels)
+            )
+            self.convs.append(GINConv(mlp, eps=0 if not train_eps else torch.rand(1).item(), train_eps=train_eps))
+            self.batch_norms.append(nn.BatchNorm1d(hidden_channels)) # Batch norm after GINConv's MLP application
+
+        self.linear = nn.Linear(hidden_channels, num_targets)
+
+    def forward(self, x, edge_index, batch):
+        for i in range(self.num_layers):
+            x = self.convs[i](x, edge_index)
+            if i < self.num_layers - 1: # Apply batch norm for hidden layers
+                 x = self.batch_norms[i](x)
+            # ReLU is typically part of the MLP in GINConv, but an extra one can be added.
+            # For simplicity, relying on MLPs' internal ReLUs.
+            x = F.dropout(x, p=self.dropout_rate, training=self.training)
+            
+        x = global_add_pool(x, batch) # GIN often uses sum pooling
+        x = self.linear(x)
+        return x
+
+class SchNetModel(nn.Module):
+    def __init__(self, num_targets: int, hidden_channels: int = 128, num_filters: int = 128,
+                 num_interactions: int = 6, num_gaussians: int = 50, cutoff: float = 10.0,
+                 readout_pool: str = 'add'):
+        super().__init__()
+        # SchNet uses atomic numbers (z) as input, which are then embedded.
+        # It does not directly use pre-computed node features (x) in the same way as GCN/GAT.
         self.schnet = SchNet(
             hidden_channels=hidden_channels,
-            num_filters=128,
-            num_interactions=6,
-            num_gaussians=50,
-            cutoff=10.0
+            num_filters=num_filters,
+            num_interactions=num_interactions,
+            num_gaussians=num_gaussians,
+            cutoff=cutoff,
+            readout=readout_pool # 'add', 'mean', 'sum'
+            # SchNet's output after readout is of size hidden_channels
         )
-        
-        self.lin = torch.nn.Linear(hidden_channels, num_targets)
-        
-    def forward(self, z, pos, batch):
-        x = self.schnet(z, pos, batch)
-        x = self.lin(x)
-        return x
-    
-# huber loss
-# 3. SchNet - For 3D molecular structures
-# This can be used directly
-schnet = SchNet(
-    hidden_channels=128,
-    num_filters=128,
-    num_interactions=6,
-    num_gaussians=50,
-    cutoff=10.0,
-    readout='add',
-    dipole=False,
-    mean=None, std=None,
-    atomref=None
-)
+        self.linear = nn.Linear(hidden_channels, num_targets)
 
-# Wrapper to adapt SchNet for your task
-class SchNetWrapper(torch.nn.Module):
-    def __init__(self, num_targets=14):
+    def forward(self, z, pos, batch):
+        # z: atomic numbers, pos: coordinates
+        node_representation = self.schnet(z, pos, batch) # SchNet returns pooled representation
+        x = self.linear(node_representation)
+        return x
+
+class MPNNModel(nn.Module): # Using NNConv
+    def __init__(self, num_node_features: int, num_edge_features: int,
+                 hidden_channels: int, num_targets: int,
+                 num_layers: int = 3, dropout_rate: float = 0.1,
+                 processing_steps_set2set: int = 3):
         super().__init__()
-        self.schnet = SchNet(
-            hidden_channels=128,
-            num_filters=128,
-            num_interactions=6,
-            num_gaussians=50,
-            cutoff=10.0
-        )
-        self.linear = torch.nn.Linear(128, num_targets)
-    
-    def forward(self, z, pos, batch):
-        x = self.schnet(z, pos, batch)
-        x = self.linear(x)
-        return x
-    
+        self.num_layers = num_layers
+        self.dropout_rate = dropout_rate
 
-class MPNNModel(torch.nn.Module):
-    def __init__(self, node_features, edge_features, hidden_channels, num_targets):
-        super(MPNNModel, self).__init__()
+        self.convs = nn.ModuleList()
         
-        # Edge network
-        self.edge_network = torch.nn.Sequential(
-            torch.nn.Linear(edge_features, hidden_channels),
-            torch.nn.ReLU(),
-            torch.nn.Linear(hidden_channels, node_features * hidden_channels)
+        # Edge network for the first layer
+        edge_nn1 = nn.Sequential(
+            nn.Linear(num_edge_features, hidden_channels), # Process edge features
+            nn.ReLU(),
+            nn.Linear(hidden_channels, num_node_features * hidden_channels) # Output: in_channels * out_channels
         )
-        
-        # Message passing layers
-        self.conv = NNConv(node_features, hidden_channels, self.edge_network, aggr='mean')
-        
-        # Readout
-        self.set2set = Set2Set(hidden_channels, processing_steps=3)
-        
-        # Output layer
-        self.lin = torch.nn.Linear(2 * hidden_channels, num_targets)
-        
-    def forward(self, x, edge_index, edge_attr, batch = 16):
-        x = F.relu(self.conv(x, edge_index, edge_attr))
-        x = F.relu(self.conv(x, edge_index, edge_attr))
-        x = F.relu(self.conv(x, edge_index, edge_attr))
+        self.convs.append(NNConv(num_node_features, hidden_channels, edge_nn1, aggr='mean'))
+
+        # Edge networks for subsequent layers
+        for _ in range(num_layers - 1):
+            edge_nn = nn.Sequential(
+                nn.Linear(num_edge_features, hidden_channels),
+                nn.ReLU(),
+                nn.Linear(hidden_channels, hidden_channels * hidden_channels) # Output: in_channels * out_channels
+            )
+            self.convs.append(NNConv(hidden_channels, hidden_channels, edge_nn, aggr='mean'))
+
+        self.set2set = Set2Set(hidden_channels, processing_steps=processing_steps_set2set)
+        # Set2Set doubles the output dimension
+        self.linear = nn.Linear(2 * hidden_channels, num_targets)
+
+    def forward(self, x, edge_index, edge_attr, batch):
+        for i in range(self.num_layers):
+            x = self.convs[i](x, edge_index, edge_attr)
+            x = F.relu(x)
+            x = F.dropout(x, p=self.dropout_rate, training=self.training)
         
         x = self.set2set(x, batch)
-        x = self.lin(x)
-        
+        x = self.linear(x)
         return x
-    
 
-class DimeNetModel(torch.nn.Module):
-    def __init__(self, hidden_channels=128, num_targets=14):
-        super(DimeNetModel, self).__init__()
-        
-        self.dimenet = DimeNet(
-            hidden_channels=hidden_channels,
-            out_channels=num_targets,
-            num_blocks=4,
-            num_bilinear=8,
-            num_spherical=7,
-            num_radial=6,
-            cutoff=10.0
-        )
-        
-    def forward(self, z, pos, batch):
-        return self.dimenet(z, pos, batch)
-
-
-# 4. DimeNet - Directional message passing for 3D structures
-class DimeNetWrapper(torch.nn.Module):
-    def __init__(self, num_targets=14):
+class DimeNetPlusPlusModel(nn.Module): # Using DimeNet++ from PyG
+    def __init__(self, num_targets: int, hidden_channels: int = 128,
+                 num_blocks: int = 4, int_emb_size: int = 64, basis_emb_size: int = 8,
+                 out_emb_channels: int = 256, num_spherical: int = 7, num_radial: int = 6,
+                 cutoff: float = 10.0, envelope_exponent: int = 5):
         super().__init__()
-        self.dimenet = DimeNet(
-            hidden_channels=128,
-            out_channels=num_targets,
-            num_blocks=4,
-            num_bilinear=8,
-            num_spherical=7,
-            num_radial=6,
-            cutoff=10.0
-        )
-    
+        # DimeNet uses atomic numbers (z) and positions (pos).
+        # It has its own embedding for z.
+        # DimeNet++ is generally recommended over the original DimeNet.
+        # The 'out_channels' in DimeNet++ is the output size *before* a final MLP.
+        # We will add our own linear layer for the final target prediction.
+        try:
+            from torch_geometric.nn.models import DimeNetPlusPlus
+            self.dimenet = DimeNetPlusPlus(
+                hidden_channels=hidden_channels,
+                out_channels=hidden_channels, # Output of DimeNet++ core, then we add a linear layer
+                num_blocks=num_blocks,
+                int_emb_size=int_emb_size,
+                basis_emb_size=basis_emb_size,
+                out_emb_channels=out_emb_channels,
+                num_spherical=num_spherical,
+                num_radial=num_radial,
+                cutoff=cutoff,
+                envelope_exponent=envelope_exponent
+            )
+            self.linear = nn.Linear(hidden_channels, num_targets) # Linear layer after DimeNet++
+            self.has_dimenetpp = True
+        except ImportError:
+            print("Warning: DimeNetPlusPlus not found. This model will not work.")
+            print("Consider installing the latest PyG version or ensuring all dependencies are met.")
+            self.has_dimenetpp = False
+            # Fallback or placeholder if DimeNetPlusPlus is not available
+            self.dimenet = None
+            self.linear = nn.Linear(1, num_targets) # Placeholder
+
+
     def forward(self, z, pos, batch):
-        return self.dimenet(z, pos, batch)
+        if not self.has_dimenetpp or self.dimenet is None:
+            # Return zeros or raise error if DimeNetPlusPlus is not available
+            return torch.zeros((batch.max().item() + 1, self.linear.out_features), device=z.device)
+
+        node_representation = self.dimenet(z, pos, batch)
+        x = self.linear(node_representation)
+        return x

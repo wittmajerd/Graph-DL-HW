@@ -1,12 +1,13 @@
 import numpy as np
 import networkx as nx
+import torch
 from torch_geometric.data import Data
 from torch_geometric.datasets import QM9
 from torch_geometric.utils import to_networkx
 
 from typing import List, Tuple, Optional
 
-def create_QM9_train_val_test_nx(train_ratio: float = 0.8,
+def create_QM9_nx_datasets(train_ratio: float = 0.8,
                                val_ratio: float = 0.1,
                                test_ratio: float = 0.1,
                                subset_size: Optional[int] = None,
@@ -78,3 +79,65 @@ def create_QM9_train_val_test_nx(train_ratio: float = 0.8,
     print(f'Test NX graphs: {len(test_nx)}, Test PyG graphs: {len(test_pyg)}')
 
     return train_nx, val_nx, test_nx, train_pyg, val_pyg, test_pyg
+
+
+def create_QM9_pyg_datasets(
+    train_ratio: float = 0.8,
+    val_ratio: float = 0.1,
+    test_ratio: float = 0.1,
+    subset_size: Optional[int] = None,
+    random_seed: int = 42) -> Tuple[List[Data], List[Data], List[Data]]:
+    """
+    Loads the QM9 dataset and splits it into training, validation, and test sets
+    of PyG Data objects. The y target values remain within each Data object.
+
+    Args:
+        train_ratio: Proportion of the dataset to allocate for training.
+        val_ratio: Proportion of the dataset to allocate for validation.
+        test_ratio: Proportion of the dataset to allocate for testing.
+        subset_size: Optional. If provided, a random subset of this size will be
+                        used from the original dataset.
+        random_seed: Seed for shuffling to ensure reproducibility.
+
+    Returns:
+        A tuple containing:
+            (train_pyg_list, val_pyg_list, test_pyg_list).
+    """
+    if not (0 < train_ratio < 1 and 0 < val_ratio < 1 and 0 < test_ratio < 1):
+        raise ValueError("Ratios must be between 0 and 1.")
+    if not np.isclose(train_ratio + val_ratio + test_ratio, 1.0):
+        raise ValueError("Sum of ratios must be equal to 1.")
+
+    np.random.seed(random_seed)
+    torch.manual_seed(random_seed) # For reproducibility in PyTorch operations if any
+
+    dataset = QM9(root='./data/QM9')
+
+    if subset_size is not None and subset_size < len(dataset):
+        indices_full_dataset = np.random.permutation(len(dataset))[:subset_size]
+        current_dataset = dataset[indices_full_dataset.tolist()]
+    else:
+        current_dataset = dataset
+
+    num_graphs = len(current_dataset)
+    permuted_local_indices = np.random.permutation(num_graphs)
+
+    train_end = int(train_ratio * num_graphs)
+    val_end = train_end + int(val_ratio * num_graphs)
+
+    train_local_idx = permuted_local_indices[:train_end]
+    val_local_idx = permuted_local_indices[train_end:val_end]
+    test_local_idx = permuted_local_indices[val_end:]
+
+    train_pyg_list = [current_dataset[int(i)] for i in train_local_idx]
+    val_pyg_list = [current_dataset[int(i)] for i in val_local_idx]
+    test_pyg_list = [current_dataset[int(i)] for i in test_local_idx]
+
+    print(f'Original QM9 dataset size: {len(dataset)}')
+    if subset_size is not None:
+        print(f'Using subset of size: {len(current_dataset)}')
+    print(f'Train PyG graphs: {len(train_pyg_list)}')
+    print(f'Validation PyG graphs: {len(val_pyg_list)}')
+    print(f'Test PyG graphs: {len(test_pyg_list)}')
+
+    return train_pyg_list, val_pyg_list, test_pyg_list
